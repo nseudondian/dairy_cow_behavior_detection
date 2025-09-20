@@ -181,3 +181,8 @@ volumes/
 
 # Repo ops
 instructions.txt
+
+# Large artifacts
+models/
+# Keep metadata but ignore binaries under data/raw
+/data/raw/
