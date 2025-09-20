@@ -178,3 +178,6 @@ coverage/
 docker-compose.override.yml
 *.pid
 volumes/
+
+# Repo ops
+instructions.txt
