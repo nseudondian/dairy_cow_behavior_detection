@@ -55,6 +55,11 @@ class Inference:
             output_path += '.mp4'
         self.output_path = output_path
         print(" Saving annotated video to:", self.output_path)
+        
+        # Brush motion tracking for filtering false positives
+        self.brush_motion_history = {}
+        self.MOTION_HISTORY_LENGTH = 10
+        self.MOTION_THRESHOLD = 2.0
 
 
 
@@ -69,17 +74,36 @@ class Inference:
         ])
         self.track_to_cnn_id = {}
 
-        self.BRUSHING_DISTANCE_THRESHOLD = 160
-        self.OVERLAP_THRESHOLD = 0.05
-        self.DRINKING_MIN_FRAMES = 75
+        # Updated thresholds based on latest calibration
+        self.BRUSHING_DISTANCE_THRESHOLD = 80  # More accurate detection
+        self.OVERLAP_THRESHOLD = 0.02  # Reduced from 0.05
+        self.DRINKING_MIN_FRAMES = 30  # More sensitive detection
+        self.DRINKING_OVERLAP_THRESHOLD_HEAD = 0.05
+        self.DRINKING_OVERLAP_THRESHOLD_COW = 0.03
         self.HEAD_DISTANCE = 10
         self.MIN_NUDGE_SPEED = 0.15
         self.DOT_PRODUCT_MIN = 0
+        
+        # Event merging parameters
+        self.MERGE_EVENT_WITHIN_SECONDS = 5.0  # Merge if restart within 5 secs
+        self.FINALIZE_EVENT_AFTER_SECONDS = 5.0  # Log event if no activity for 5 secs
 
         self.headbutt_log = []
-        self.brushing_states = {}
-        self.drinking_states = {}
+        # New event state tracking with merging support
+        self.brushing_states = {}  # Will store: merged_event_start_frame, last_active_segment_end_frame, is_active_in_previous_frame
+        self.drinking_states = {}  # Same structure as brushing_states
 
+    def is_brush_moving(self, brush_id):
+        """Check if brush is actually moving to filter false positives"""
+        history = self.brush_motion_history.get(brush_id, [])
+        if len(history) < 2:
+            return False
+        total_dist = sum(calculate_centroid_distance(history[i-1], history[i]) for i in range(1, len(history)))
+        if len(history) > 1:
+            avg_dist = total_dist / (len(history) - 1)
+            return avg_dist > self.MOTION_THRESHOLD
+        return False
+    
     def predict_cow_id(self, image):
         image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
         image_tensor = self.transform(image).unsqueeze(0)
@@ -123,13 +147,16 @@ class Inference:
         recent_hits = {}
         frame_idx = 0
         frame_count = 0
+        
+        # Calculate frame thresholds for event merging
+        MERGE_THRESHOLD_FRAMES = int(self.MERGE_EVENT_WITHIN_SECONDS * self.fps)
+        FINALIZE_EVENT_GAP_FRAMES = int(self.FINALIZE_EVENT_AFTER_SECONDS * self.fps)
+        
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
-            frame_count += 1
-                
-            print(f" Inference completed. Total frames processed: {frame_count}")
+            
             results = self.model.track(frame, conf=0.3, tracker="bytetrack.yaml")
             if not results or len(results[0].boxes) == 0:
                 out_vid.write(frame)
@@ -153,7 +180,13 @@ class Inference:
                 tid = ids[i]
 
                 if cls == 0:
-                    brush_boxes.append(bbox)
+                    brush_boxes.append((tid, bbox))
+                    # Update brush motion history
+                    centroid = calculate_centroid(bbox)
+                    history = self.brush_motion_history.setdefault(tid, [])
+                    history.append(centroid)
+                    if len(history) > self.MOTION_HISTORY_LENGTH:
+                        history.pop(0)
                 elif cls == 1:
                     cow_boxes.append((tid, bbox))
                 elif cls == 2 and scores[i] > 0.5:
@@ -164,7 +197,7 @@ class Inference:
             for _, head_box in head_boxes:
                 cv2.rectangle(frame, (head_box[0], head_box[1]), (head_box[2], head_box[3]), (255, 255, 102), 2)
                 cv2.putText(frame, "Cow Head", (head_box[0], head_box[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 102), 2)
-            for brush_box in brush_boxes:
+            for _, brush_box in brush_boxes:
                 cv2.rectangle(frame, (brush_box[0], brush_box[1]), (brush_box[2], brush_box[3]), (255, 0, 0), 2)
                 cv2.putText(frame, "Brush", (brush_box[0], brush_box[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
@@ -177,94 +210,179 @@ class Inference:
                     cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 2)
                     cv2.putText(frame, label, (bbox[0], bbox[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-#             # Brushing detection logic 
+            # Brushing detection with motion filtering and event merging
+            brushing_cows_current_frame = set()
             for tid, cow_box in cow_boxes:
                 cow_centroid = calculate_centroid(cow_box)
-                is_brushing = any(
-                    calculate_centroid_distance(cow_centroid, calculate_centroid(brush)) < self.BRUSHING_DISTANCE_THRESHOLD or
-                    are_boxes_overlapping(cow_box, brush)[0]
-                    for brush in brush_boxes
-                )
-                if tid not in self.brushing_states:
-                    self.brushing_states[tid] = {'active': False, 'start_frame': None}
-                state = self.brushing_states[tid]
-                if is_brushing:
-                    if not state['active']:
-                        state['active'] = True
-                        state['start_frame'] = frame_idx
-                    brushing_duration = (frame_idx - state['start_frame']) / self.fps
-                    cv2.putText(frame, f"Brushing", (cow_box[0], cow_box[1]-30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-                elif state['active']:
-                    brushing_duration = (frame_idx - state['start_frame']) / self.fps
-
-                    if brushing_duration >= 1.0 and frame_idx % 50 == 0:
-                        clean_tid = str(int(tid))
-                        event_key = f"{clean_tid}_{state['start_frame']}"
-
-                        if event_key not in self.logged_brushing:
-                            self.db.insert_cow_events_data(
-                                clean_tid,
-                                'Brushing',
-                                round(brushing_duration, 2),
-                                os.path.basename(self.video_path),
-                                date_str,
-                                time_str,
-                                cam_str,
-                                round(brushing_duration, 2),
-                                None
-                            )
-                            self.logged_brushing.add(event_key)
+                # Check if cow is near a moving brush
+                is_brushing = False
+                for brush_tid, brush in brush_boxes:
+                    brush_moving = self.is_brush_moving(brush_tid)
+                    distance_close = calculate_centroid_distance(cow_centroid, calculate_centroid(brush)) < self.BRUSHING_DISTANCE_THRESHOLD
+                    overlap, area = are_boxes_overlapping(cow_box, brush)
+                    overlap_sufficient = overlap and area > self.OVERLAP_THRESHOLD
+                    
+                    if (distance_close or overlap_sufficient) and brush_moving:
+                        is_brushing = True
+                        break
                 
-                    state['active'] = False
+                if is_brushing:
+                    brushing_cows_current_frame.add(tid)
+                    cv2.putText(frame, f"Brushing", (cow_box[0], cow_box[1]-30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+            
+            # Update brushing states with event merging logic
+            all_known_cow_ids = set(self.brushing_states.keys()).union([tid for tid, _ in cow_boxes])
+            for cow_id in all_known_cow_ids:
+                is_brushing_now = cow_id in brushing_cows_current_frame
+                
+                if cow_id not in self.brushing_states:
+                    self.brushing_states[cow_id] = {
+                        'merged_event_start_frame': None,
+                        'last_active_segment_end_frame': None,
+                        'is_active_in_previous_frame': False
+                    }
+                
+                state = self.brushing_states[cow_id]
+                
+                if is_brushing_now:
+                    if not state['is_active_in_previous_frame']:
+                        # Starting or restarting brushing
+                        if state['merged_event_start_frame'] is None:
+                            # Brand new event
+                            state['merged_event_start_frame'] = frame_idx
+                        elif state['last_active_segment_end_frame'] is not None:
+                            # Check if we should merge or start new event
+                            gap_frames = frame_idx - state['last_active_segment_end_frame'] - 1
+                            if gap_frames > MERGE_THRESHOLD_FRAMES:
+                                # Gap too large, finalize old event and start new
+                                duration_seconds = (state['last_active_segment_end_frame'] - state['merged_event_start_frame'] + 1) / self.fps
+                                if duration_seconds >= 1.0:
+                                    clean_tid = str(int(cow_id))
+                                    event_key = f"{clean_tid}_{state['merged_event_start_frame']}"
+                                    if event_key not in self.logged_brushing:
+                                        self.db.insert_cow_events_data(
+                                            clean_tid, 'Brushing', round(duration_seconds, 2),
+                                            os.path.basename(self.video_path), date_str, time_str, cam_str,
+                                            round(duration_seconds, 2), None
+                                        )
+                                        self.logged_brushing.add(event_key)
+                                state['merged_event_start_frame'] = frame_idx
+                    
+                    state['is_active_in_previous_frame'] = True
+                    state['last_active_segment_end_frame'] = frame_idx
+                else:
+                    # Not brushing this frame
+                    state['is_active_in_previous_frame'] = False
+                    
+                    # Check if we should finalize the event
+                    if state['merged_event_start_frame'] is not None and state['last_active_segment_end_frame'] is not None:
+                        gap_frames = frame_idx - state['last_active_segment_end_frame'] - 1
+                        if gap_frames > FINALIZE_EVENT_GAP_FRAMES:
+                            # Finalize the event
+                            duration_seconds = (state['last_active_segment_end_frame'] - state['merged_event_start_frame'] + 1) / self.fps
+                            if duration_seconds >= 1.0:
+                                clean_tid = str(int(cow_id))
+                                event_key = f"{clean_tid}_{state['merged_event_start_frame']}"
+                                if event_key not in self.logged_brushing:
+                                    self.db.insert_cow_events_data(
+                                        clean_tid, 'Brushing', round(duration_seconds, 2),
+                                        os.path.basename(self.video_path), date_str, time_str, cam_str,
+                                        round(duration_seconds, 2), None
+                                    )
+                                    self.logged_brushing.add(event_key)
+                            state['merged_event_start_frame'] = None
 
-            # Drinking detection
+            # Drinking detection with improved thresholds and event merging
+            drinking_cows_current_frame = set()
             for tid, cow_box in cow_boxes:
-                head_box = cow_box
+                # Find matching head if available
+                head_box = None
                 for _, hbox in head_boxes:
                     if self.is_inside(hbox, cow_box):
                         head_box = hbox
                         break
-                threshold = 0.15 if not np.array_equal(head_box, cow_box) else 0.05
+                
+                # Use improved thresholds
+                det_box = head_box if head_box is not None else cow_box
+                threshold = self.DRINKING_OVERLAP_THRESHOLD_HEAD if head_box is not None else self.DRINKING_OVERLAP_THRESHOLD_COW
+                
                 drinking_near = False
                 for tub in tub_boxes:
-                    overlap, area = are_boxes_overlapping(head_box, tub)
+                    overlap, area = are_boxes_overlapping(det_box, tub)
                     if overlap and area > threshold:
                         drinking_near = True
                         cv2.rectangle(frame, (tub[0], tub[1]), (tub[2], tub[3]), (0, 255, 255), 2)
                         cv2.putText(frame, "Water Tub", (tub[0], tub[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-
-                if tid not in self.drinking_states:
-                    self.drinking_states[tid] = {'active': False, 'start_frame': None}
-                state = self.drinking_states[tid]
+                        break
+                
                 if drinking_near:
-                    if not state['active']:
-                        state['active'] = True
-                        state['start_frame'] = frame_idx
-                    drinking_duration = (frame_idx - state['start_frame']) / self.fps
+                    drinking_cows_current_frame.add(tid)
                     cv2.putText(frame, f"Drinking", (cow_box[0], cow_box[1]-50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                     cv2.rectangle(frame, (cow_box[0], cow_box[1]), (cow_box[2], cow_box[3]), (255, 255, 0), 2)
-                elif state['active']:
-                    drinking_duration = (frame_idx - state['start_frame']) / self.fps
-
-                    if drinking_duration >= 1.0 and frame_idx % 50 == 0:
-                        clean_tid = str(int(tid))
-                        event_key = f"{clean_tid}_{state['start_frame']}"
-
-                        if event_key not in self.logged_drinking:
-                            self.db.insert_cow_events_data(
-                                clean_tid,
-                                'Drinking',
-                                round(drinking_duration, 2),
-                                os.path.basename(self.video_path),
-                                date_str,
-                                time_str,
-                                cam_str,
-                                round(drinking_duration, 2),
-                                None
-                            )
-                            self.logged_drinking.add(event_key)
-                 
-                    state['active'] = False
+            
+            # Update drinking states with event merging logic
+            all_known_cow_ids_drinking = set(self.drinking_states.keys()).union([tid for tid, _ in cow_boxes])
+            for cow_id in all_known_cow_ids_drinking:
+                is_drinking_now = cow_id in drinking_cows_current_frame
+                
+                if cow_id not in self.drinking_states:
+                    self.drinking_states[cow_id] = {
+                        'merged_event_start_frame': None,
+                        'last_active_segment_end_frame': None,
+                        'is_active_in_previous_frame': False
+                    }
+                
+                d_state = self.drinking_states[cow_id]
+                
+                if is_drinking_now:
+                    if not d_state['is_active_in_previous_frame']:
+                        # Starting or restarting drinking
+                        if d_state['merged_event_start_frame'] is None:
+                            # Brand new event
+                            d_state['merged_event_start_frame'] = frame_idx
+                        elif d_state['last_active_segment_end_frame'] is not None:
+                            # Check if we should merge or start new event
+                            gap_frames = frame_idx - d_state['last_active_segment_end_frame'] - 1
+                            if gap_frames > MERGE_THRESHOLD_FRAMES:
+                                # Gap too large, finalize old event and start new
+                                duration_frames = d_state['last_active_segment_end_frame'] - d_state['merged_event_start_frame'] + 1
+                                if duration_frames >= self.DRINKING_MIN_FRAMES:
+                                    duration_seconds = duration_frames / self.fps
+                                    clean_tid = str(int(cow_id))
+                                    event_key = f"{clean_tid}_{d_state['merged_event_start_frame']}"
+                                    if event_key not in self.logged_drinking:
+                                        self.db.insert_cow_events_data(
+                                            clean_tid, 'Drinking', round(duration_seconds, 2),
+                                            os.path.basename(self.video_path), date_str, time_str, cam_str,
+                                            round(duration_seconds, 2), None
+                                        )
+                                        self.logged_drinking.add(event_key)
+                                d_state['merged_event_start_frame'] = frame_idx
+                    
+                    d_state['is_active_in_previous_frame'] = True
+                    d_state['last_active_segment_end_frame'] = frame_idx
+                else:
+                    # Not drinking this frame
+                    d_state['is_active_in_previous_frame'] = False
+                    
+                    # Check if we should finalize the event
+                    if d_state['merged_event_start_frame'] is not None and d_state['last_active_segment_end_frame'] is not None:
+                        gap_frames = frame_idx - d_state['last_active_segment_end_frame'] - 1
+                        if gap_frames > FINALIZE_EVENT_GAP_FRAMES:
+                            # Finalize the event
+                            duration_frames = d_state['last_active_segment_end_frame'] - d_state['merged_event_start_frame'] + 1
+                            if duration_frames >= self.DRINKING_MIN_FRAMES:
+                                duration_seconds = duration_frames / self.fps
+                                clean_tid = str(int(cow_id))
+                                event_key = f"{clean_tid}_{d_state['merged_event_start_frame']}"
+                                if event_key not in self.logged_drinking:
+                                    self.db.insert_cow_events_data(
+                                        clean_tid, 'Drinking', round(duration_seconds, 2),
+                                        os.path.basename(self.video_path), date_str, time_str, cam_str,
+                                        round(duration_seconds, 2), None
+                                    )
+                                    self.logged_drinking.add(event_key)
+                            d_state['merged_event_start_frame'] = None
 
             # Headbutt detection
             current_cows = []
@@ -364,9 +482,40 @@ class Inference:
             frame_idx += 1
             frame_count += 1
 
+        # Finalize any remaining events at end of video
+        for cow_id, state in self.brushing_states.items():
+            if state['merged_event_start_frame'] is not None and state['last_active_segment_end_frame'] is not None:
+                duration_seconds = (state['last_active_segment_end_frame'] - state['merged_event_start_frame'] + 1) / self.fps
+                if duration_seconds >= 1.0:
+                    clean_tid = str(int(cow_id))
+                    event_key = f"{clean_tid}_{state['merged_event_start_frame']}"
+                    if event_key not in self.logged_brushing:
+                        self.db.insert_cow_events_data(
+                            clean_tid, 'Brushing', round(duration_seconds, 2),
+                            os.path.basename(self.video_path), date_str, time_str, cam_str,
+                            round(duration_seconds, 2), None
+                        )
+                        self.logged_brushing.add(event_key)
+        
+        for cow_id, d_state in self.drinking_states.items():
+            if d_state['merged_event_start_frame'] is not None and d_state['last_active_segment_end_frame'] is not None:
+                duration_frames = d_state['last_active_segment_end_frame'] - d_state['merged_event_start_frame'] + 1
+                if duration_frames >= self.DRINKING_MIN_FRAMES:
+                    duration_seconds = duration_frames / self.fps
+                    clean_tid = str(int(cow_id))
+                    event_key = f"{clean_tid}_{d_state['merged_event_start_frame']}"
+                    if event_key not in self.logged_drinking:
+                        self.db.insert_cow_events_data(
+                            clean_tid, 'Drinking', round(duration_seconds, 2),
+                            os.path.basename(self.video_path), date_str, time_str, cam_str,
+                            round(duration_seconds, 2), None
+                        )
+                        self.logged_drinking.add(event_key)
+        
         cap.release()
         out_vid.release()
         print(f"Opened video: {self.video_path}")
+        print(f" Inference completed. Total frames processed: {frame_count}")
 
         def fix_video_for_browser(original_path):
             # Create a fixed output path
